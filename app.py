@@ -2,96 +2,103 @@ import streamlit as st
 import requests
 import io
 import re
-from pypdf import PdfWriter
 import time
+from pypdf import PdfWriter, PdfReader
 
 st.set_page_config(page_title="GodEx ZPL Converter", page_icon="🖨️")
 
-st.title("🖨️ GodEx: Conversor Blindado")
-st.markdown("Modo Hormiga: Procesa 1 a 1 para evitar caídas del servidor.")
+st.title("🖨️ GodEx: Fotocopiadora Inteligente")
+st.markdown("Detecta cantidades (^PQ), descarga 1 matriz y multiplica en el PDF.")
 
-# Opciones laterales
-with st.sidebar:
-    st.header("Configuración")
-    ancho = st.number_input("Ancho (pulgadas)", value=2.0)
-    alto = st.number_input("Alto (pulgadas)", value=1.0)
-    # Checkbox clave para evitar error 413 por exceso de copias
-    forzar_una = st.checkbox("Forzar 1 copia (Ignorar ^PQ)", value=True, help="Si tu ZPL pide 50 copias, esto lo baja a 1 para que el PDF no explote.")
+# Configuración 2x1
+ancho = 2
+alto = 1
+dpmm = "8dpmm"
 
 uploaded_file = st.file_uploader("Arrastrá tu archivo .txt aquí", type=["txt"])
 
 if uploaded_file is not None:
     raw_data = uploaded_file.getvalue().decode("utf-8", errors='ignore')
     
-    # Limpieza: Separar por ^XZ (fin de etiqueta)
-    # A veces los archivos traen basura antes del ^XA, limpiamos eso.
+    # Separamos por etiquetas (^XZ) y limpiamos vacíos
     raw_labels = raw_data.split('^XZ')
-    labels = []
-    for l in raw_labels:
-        clean_l = l.strip()
-        if "^XA" in clean_l: # Solo procesamos si tiene inicio de etiqueta
-            # Aseguramos que termine con ^XZ
-            labels.append(clean_l + '^XZ')
+    labels = [l.strip() + '^XZ' for l in raw_labels if "^XA" in l]
+    
+    total_designs = len(labels)
+    
+    if total_designs == 0:
+        st.error("No se encontró código ZPL válido.")
+    else:
+        # Calcular total teórico para informar al usuario
+        total_etiquetas_finales = 0
+        for l in labels:
+            m = re.search(r'\^PQ(\d+)', l)
+            total_etiquetas_finales += int(m.group(1)) if m else 1
             
-    total_labels = len(labels)
-    st.info(f"Detectadas {total_labels} etiquetas individuales.")
+        st.info(f"Detectados {total_designs} diseños únicos. Se generarán un total de {total_etiquetas_finales} etiquetas.")
 
-    if st.button(f'Generar PDF ({total_labels} etiq.)'):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        pdf_writer = PdfWriter()
-        errores = 0
-        
-        # URL base
-        url = f"http://api.labelary.com/v1/printers/8dpmm/labels/{ancho}x{alto}/0/"
-        
-        for i, zpl_code in enumerate(labels):
-            status_text.text(f"Procesando etiqueta {i+1} de {total_labels}...")
+        if st.button(f'Generar PDF Masivo ({total_etiquetas_finales} etiq.)'):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
-            # TRUCO: Modificar el ZPL al vuelo si está activado el "Forzar 1 copia"
-            if forzar_una:
-                # Reemplazamos cualquier ^PQ... por ^PQ1
-                zpl_code = re.sub(r'\^PQ\d+', '^PQ1', zpl_code)
+            final_pdf_writer = PdfWriter()
+            url = f"http://api.labelary.com/v1/printers/{dpmm}/labels/{ancho}x{alto}/0/"
             
-            try:
-                # Enviamos como data raw en lugar de files para ser más ligeros
-                headers = {'Accept': 'application/pdf'}
-                response = requests.post(url, data=zpl_code, headers=headers)
+            errores = 0
 
-                if response.status_code == 200:
-                    batch_pdf = io.BytesIO(response.content)
-                    pdf_writer.append(batch_pdf)
+            for i, zpl_code in enumerate(labels):
+                status_text.text(f"Procesando diseño {i+1} de {total_designs}...")
+                
+                # --- INTELIGENCIA GODEX ---
+                # 1. Detectar cuántas copias pide el ZPL original
+                match_qty = re.search(r'\^PQ(\d+)', zpl_code)
+                cantidad_copias = int(match_qty.group(1)) if match_qty else 1
+                
+                # 2. "Trucar" el ZPL para pedirle SOLO UNA a la API (Velocidad pura)
+                # Reemplaza ^PQ59 por ^PQ1
+                zpl_para_api = re.sub(r'\^PQ\d+', '^PQ1', zpl_code)
+                if "^PQ" not in zpl_para_api: 
+                     zpl_para_api = zpl_para_api.replace("^XZ", "^PQ1^XZ")
+
+                # 3. Llamada a la API (Intentos automáticos por si falla)
+                pdf_content = None
+                for intento in range(3):
+                    try:
+                        r = requests.post(url, data=zpl_para_api, headers={'Accept': 'application/pdf'})
+                        if r.status_code == 200:
+                            pdf_content = r.content
+                            break
+                        elif r.status_code == 429: # Too many requests
+                            time.sleep(2)
+                    except:
+                        time.sleep(1)
+                
+                if pdf_content:
+                    # 4. FOTOCOPIADORA
+                    # Leemos la etiqueta maestra
+                    reader = PdfReader(io.BytesIO(pdf_content))
+                    pagina_maestra = reader.pages[0]
+                    
+                    # La clonamos "cantidad_copias" veces
+                    for _ in range(cantidad_copias):
+                        final_pdf_writer.add_page(pagina_maestra)
                 else:
-                    st.warning(f"Etiqueta {i+1} falló (Error {response.status_code}). Se omitió.")
+                    st.error(f"Error procesando diseño {i+1}")
                     errores += 1
-            
-            except Exception as e:
-                st.error(f"Error de conexión en etiqueta {i+1}: {e}")
-                errores += 1
-            
-            # Actualizar barra
-            progress_bar.progress((i + 1) / total_labels)
-            # Pequeña pausa para no saturar la API gratuita
-            time.sleep(0.1)
+                
+                progress_bar.progress((i + 1) / total_designs)
+                time.sleep(0.2) # Respeto a la API
 
-        # Resultado final
-        status_text.text("Finalizado.")
-        
-        if errores < total_labels:
+            # Finalización
+            status_text.text("Compilando PDF final...")
             output_pdf = io.BytesIO()
-            pdf_writer.write(output_pdf)
+            final_pdf_writer.write(output_pdf)
             output_pdf.seek(0)
             
-            msg = "¡Listo!"
-            if errores > 0:
-                msg += f" (Ojo: {errores} etiquetas fallaron y no están en el PDF)"
-            
-            st.success(msg)
+            st.success("¡Listo! PDF Generado.")
             st.download_button(
-                label="⬇️ Descargar PDF Final",
+                label=f"⬇️ Descargar PDF ({total_etiquetas_finales} etiquetas)",
                 data=output_pdf,
-                file_name="etiquetas_godex_blindado.pdf",
+                file_name="etiquetas_godex_full.pdf",
                 mime="application/pdf"
             )
-        else:
-            st.error("Todas las etiquetas fallaron. Revisá que el formato ZPL sea correcto (debe tener ^XA y ^XZ).")
