@@ -36,20 +36,30 @@ with st.sidebar:
 
 
 def calcular_bbox_zpl(zpl: str):
-    """Devuelve (max_x, max_y) en dots del contenido ZPL."""
-    xs, ys = [0], [0]
-    # ^FO y ^FT: posiciones absolutas
-    for m in re.finditer(r'\^F[OT](\d+),(\d+)', zpl):
-        xs.append(int(m.group(1)))
-        ys.append(int(m.group(2)))
-    max_x_base = max(xs)
-    max_y_base = max(ys)
-    # Ancho extra por ^FB (field block ancho)
-    fb_widths = [int(m.group(1)) for m in re.finditer(r'\^FB(\d+)', zpl)]
-    extra_w = max(fb_widths) if fb_widths else 120
-    # Alto extra por la última línea (barcode / texto)
-    extra_h = 70
-    return max_x_base + extra_w, max_y_base + extra_h
+    """
+    Recorre el ZPL secuencialmente y asocia cada ^FB con el ^FO/^FT previo.
+    Devuelve (max_right, max_bottom) en dots desde el origen (0,0).
+    """
+    max_right = 0
+    max_bottom = 0
+    current_x = 0
+    current_y = 0
+    for m in re.finditer(r'\^(FO|FT|FB)(\d+)(?:,(\d+))?', zpl):
+        cmd = m.group(1)
+        a = int(m.group(2))
+        b = int(m.group(3)) if m.group(3) else 0
+        if cmd in ('FO', 'FT'):
+            current_x = a
+            current_y = b
+            # Ancho por defecto para elementos sin ^FB (texto corto, SKU, etc.)
+            max_right = max(max_right, a + 80)
+            max_bottom = max(max_bottom, b + 30)
+        elif cmd == 'FB':
+            # ^FB define el ancho del bloque para el ^FO/^FT inmediato anterior
+            max_right = max(max_right, current_x + a)
+            max_bottom = max(max_bottom, current_y + 40)
+    # Margen inferior para altura de última línea / barcode
+    return max_right, max_bottom + 30
 
 
 def centrar_zpl(zpl: str, ancho_pulg: float, alto_pulg: float) -> str:
@@ -87,6 +97,13 @@ if uploaded_file is not None:
         st.success(f"📂 Archivo cargado. Modo: {modo}")
         st.write(f"Diseños detectados: **{total_designs}** | Etiquetas totales a generar: **{total_etiquetas_finales}**")
 
+        # Debug opcional: ver el offset calculado del primer diseño
+        if centrar and labels:
+            bw, bh = calcular_bbox_zpl(labels[0])
+            tw, th = int(ancho * 203), int(alto * 203)
+            ox, oy = max(0, (tw - bw) // 2), max(0, (th - bh) // 2)
+            st.caption(f"Debug diseño 1 → bbox contenido: {bw}x{bh} dots | target: {tw}x{th} dots | offset: ({ox},{oy})")
+
         if st.button(f'🚀 Generar PDF ({total_etiquetas_finales} etiquetas)'):
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -97,20 +114,16 @@ if uploaded_file is not None:
             for i, zpl_code in enumerate(labels):
                 status_text.text(f"Procesando diseño {i+1} de {total_designs}...")
 
-                # 1. Detectar copias
                 match_qty = re.search(r'\^PQ(\d+)', zpl_code)
                 cantidad_copias = int(match_qty.group(1)) if match_qty else 1
 
-                # 2. Forzar 1 copia para la API
                 zpl_para_api = re.sub(r'\^PQ\d+(,\d+){0,3}', '^PQ1', zpl_code)
                 if "^PQ" not in zpl_para_api:
                     zpl_para_api = zpl_para_api.replace("^XZ", "^PQ1^XZ")
 
-                # 3. Centrar contenido según el tamaño objetivo
                 if centrar:
                     zpl_para_api = centrar_zpl(zpl_para_api, ancho, alto)
 
-                # 4. Llamada a Labelary con retry
                 pdf_content = None
                 for intento in range(3):
                     try:
@@ -127,8 +140,6 @@ if uploaded_file is not None:
                     reader = PdfReader(io.BytesIO(pdf_content))
                     pagina_maestra = reader.pages[0]
 
-                    # 5. Recortar la página al tamaño real de la etiqueta
-                    # (Labelary a veces devuelve A4/Letter con la etiqueta arriba-izquierda)
                     w_pt = ancho * 72
                     h_pt = alto * 72
                     page_h = float(pagina_maestra.mediabox.height)
